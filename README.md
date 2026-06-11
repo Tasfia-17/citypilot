@@ -2,7 +2,7 @@
 
 **The Autonomous Operating System for a City**
 
-CityPilot is a multi-agent AI system built for the Google + Partner Hackathon 2026. It continuously monitors urban systems across a city district, detects cross-system crises before they escalate, and generates coordinated multi-department action plans, all while keeping a human operator in full command. The mayor types a mission. Five AI agents execute it. The operator approves the result.
+CityPilot is a multi-agent AI system built for the Google + MongoDB + Elastic + Dynatrace + Arize + Fivetran Hackathon 2026. It continuously monitors urban systems across a city district, detects cross-system crises before they escalate, and generates coordinated multi-department action plans, all while keeping a human operator in full command. The mayor types a mission. Five AI agents execute it. The operator approves the result.
 
 This is not a chatbot. It is a Goal to Autonomous Investigation to Multi-Agency Coordination to Action Plan system that feels like a prototype of a future urban operating system.
 
