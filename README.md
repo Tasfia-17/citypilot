@@ -1,116 +1,126 @@
 # CityPilot
 
-**The Autonomous Operating System for a City**
+**The City Has a Brain Now**
 
-CityPilot is a multi-agent AI system built for the Google + MongoDB + Elastic + Dynatrace + Arize + Fivetran Hackathon 2026. It continuously monitors urban systems across a city district, detects cross-system crises before they escalate, and generates coordinated multi-department action plans, all while keeping a human operator in full command. The mayor types a mission. Five AI agents execute it. The operator approves the result.
+Every hour, a city district generates thousands of signals. A rainstorm is coming. A stadium fills with 60,000 people. The subway is under maintenance. Three hundred residents have filed noise and traffic complaints in the last two days. Somewhere in that overlap is a crisis that nobody sees coming, because no single person can hold all those signals at once.
 
-This is not a chatbot. It is a Goal to Autonomous Investigation to Multi-Agency Coordination to Action Plan system that feels like a prototype of a future urban operating system.
+CityPilot does. It reads every signal, finds the crisis before it happens, writes the action plan, and puts it in front of the decision-maker with a single button: Approve.
+
+Built for the Google + MongoDB + Elastic + Dynatrace + Arize + Fivetran Hackathon 2026 using Google ADK 2.0, Gemini 2.0 Flash, and five specialized AI agents connected to real city data through MCP.
 
 ---
 
 ## The Problem
 
-City operations today are deeply fragmented. Traffic engineers do not talk to transit managers. Sanitation crews are dispatched reactively, after complaints pile up. Weather forecasts sit in one system while event schedules live in another. Infrastructure monitors are separate from public complaint feeds. The result: cities react to crises instead of preventing them.
+City operations today are deeply fragmented. Traffic engineers do not talk to transit managers. Sanitation crews are dispatched reactively, after complaints pile up. Weather forecasts sit in one system while event schedules live in another. Infrastructure monitors are separate from public complaint feeds.
 
 When 60,000 people descend on a stadium district during a rainstorm while the local subway line is under maintenance, no single city employee has a complete picture. Each department sees its own slice. Nobody has the full signal until the congestion, complaints, and chaos are already happening.
 
-The cost is real: delayed emergency response, frustrated residents, wasted crew deployments, and reputational damage to city leadership. A mid-size city district generates hundreds of coordinated decisions every week that require data no single human can hold in their head.
+A mid-size city district generates hundreds of coordinated decisions every week that require data no single human can hold in their head.
 
 ---
 
-## The Solution
+## How We Built It
 
-CityPilot gives city operators a city-scale brain.
+We built CityPilot in five concrete layers, one on top of the other. Each layer was designed before the next one started.
 
-The system ingests real urban signals continuously: live weather forecasts, resident complaint firehoses, event schedules with capacity numbers, and infrastructure health telemetry. Five specialized AI agents built with Google ADK collaborate to analyze these signals, detect anomalies, retrieve historical precedents using semantic search, generate quantified action plans, and produce a mayoral briefing with predicted impact.
+### Step 1: Connect Real City Data Sources
 
-The operator sees everything happening in real time: which agent is running, which MCP tool it just called, what data it found. They read the plan. They click Approve. The city moves.
+Before writing a single agent, we connected to three live public APIs and built ingestion connectors for each one.
 
-Human oversight is not an afterthought. It is the core design principle.
+**NYC 311 Open Data** via the Socrata API at `data.cityofnewyork.us/resource/erm2-nwe9.json`. This is the real dataset New York City publishes daily. It contains over 24 million service request records: noise complaints, traffic signal failures, water main issues, illegal parking, heat outages. We built `complaints_connector.py` to fetch recent records filtered by date and borough, normalize the Socrata schema into our own document shape, and bulk-upsert into MongoDB with duplicate detection on `unique_key`. Running `python data/seed_nyc_311.py` pulls 30 days of real history across Manhattan, Brooklyn, and Queens.
+
+**OpenWeatherMap** via the forecast API at `api.openweathermap.org/data/2.5/forecast`. We built `weather_connector.py` to fetch current conditions and 5-day 3-hour forecasts for each NYC district centroid, store them in MongoDB, and fall back to realistic mock data when no API key is configured so the demo always runs.
+
+**Ticketmaster Discovery API** at `app.ticketmaster.com/discovery/v2/events.json`. We built `events_connector.py` to pull upcoming NYC events with venue names, addresses, and capacity numbers. A football match with 60,000 attendees tomorrow is a real data signal, not a hardcoded scenario.
+
+All three connectors run on startup and refresh on a background schedule. They also run on demand when the orchestrator agent decides the situation requires fresher data.
+
+### Step 2: Design the MongoDB Data Model
+
+With data flowing, we designed the MongoDB collections to serve every query the agents would need.
+
+The `complaints` collection stores the NYC 311 data with a `2dsphere` geospatial index on `location` for proximity queries, a compound index on `complaint_type` and `incident_zip` for aggregation, and a vector search index named `complaint_embeddings` on a 768-dimension `embedding` field with cosine similarity. That vector index is what allows the Impact Forecaster to find historically similar incidents by semantic meaning, not just keyword match.
+
+The `sensor_readings` collection is a MongoDB native time-series collection created with `timeField: "timestamp"`, `metaField: "sensor_id"`, and `granularity: "minutes"`. This is the right MongoDB type for IoT-style signal data and it enables efficient range queries over the timeline.
+
+The `action_plans` collection stores every agent-generated plan with a `status` field that progresses from `pending_approval` to `approved` or `rejected`. The mayor's click writes a single `update-one` through the MongoDB MCP server.
+
+The `resources` collection stores available city crews, vehicles, and equipment with zone assignments and availability status. The Operations Planner queries this before allocating resources.
+
+### Step 3: Build the Five-Agent Pipeline with Google ADK
+
+With data and storage ready, we built the agents using Google ADK 2.0. Each agent is a separate `Agent` class with its own instruction, model, and MCP toolset. Sub-agents run in `single_turn` mode so they complete their task and return control automatically. The root orchestrator holds them all as `sub_agents`.
+
+**Signal Collector** is the first agent to run on every mission. It connects to the MongoDB MCP server via `StdioConnectionParams` launching `@mongodb-js/mongodb-mcp-server` as a subprocess. It calls `find` to pull 311 complaints from the last 48 hours filtered by district, `aggregate` with a `$group` pipeline to count complaints by type and zip code, and `count` to get volume totals. It also queries the `events` and `weather` collections. Every number in its output came from a live database query, not a language model generating plausible-sounding figures.
+
+**Anomaly Detector** takes the signal summary and runs statistical analysis. It calls MongoDB `aggregate` with `$group` and `$match` to compare current complaint volume against the 30-day baseline stored in the database. Zones with more than two standard deviations of deviation are flagged. It also calls the Dynatrace MCP server via `StreamableHTTPConnectionParams` to check the `get_active_problems` endpoint for any Davis AI problem alerts on city services, and runs a DQL query `fetch logs | filter service == "transit-data-feed" | summarize avg(duration)` to measure actual transit API latency. If the feed is degraded, that caveat is written into the output and propagates through the rest of the pipeline.
+
+**Impact Forecaster** is where the real differentiation happens. It calls the Elastic MCP server to run a hybrid search query against `city_knowledge` and `city_policies`, combining BM25 keyword scoring on policy names with kNN cosine similarity on 768-dimension dense vectors. The query "bus rerouting protocol during stadium event with rain and transit maintenance" returns the actual NYC Stadium Event Traffic Management SOP. It also runs a MongoDB `aggregate` pipeline with a `$vectorSearch` stage against `complaint_embeddings` to find the five most semantically similar historical incidents and their outcomes. The forecast is grounded in both official city policy and empirical case history.
+
+**Operations Planner** reads the forecast and queries MongoDB `find` on the `resources` collection to see what crews and vehicles are actually available in the target district. It generates specific, named actions: which bus route number to reroute and via which street, how many sanitation crews with which zone assignments, which intersections need traffic officers and at what time. It writes the full plan to MongoDB using `insert-many` with `status: "pending_approval"`.
+
+**Executive Briefer** pulls the stored plan from MongoDB with `find` and synthesizes the mayoral situation report. Top three risks ranked by severity. A two-sentence situation summary. The action list with department, timing, and predicted impact per action. Quantified overall impact: congestion reduction percentage, complaint reduction percentage, population served, and prediction confidence. This document is what appears in the dashboard.
+
+### Step 4: Wire Up the Integrations
+
+With the agents working, we connected each external platform.
+
+**Elastic** was set up with two indices. `city_knowledge` holds municipal regulations, infrastructure maintenance manuals, and departmental SOPs. `city_policies` holds operational rules like bus rerouting tables and emergency shelter locations. Both indices use `dense_vector` fields (768 dimensions) for kNN semantic search alongside `text` fields with the English analyzer for BM25. The `elastic_client.py` seeds these indices on first run from the hardcoded NYC SOP library in the codebase. The Elastic MCP server at `{ELASTIC_URL}/_mcp` is accessed by the Impact Forecaster via `StreamableHTTPConnectionParams`.
+
+**Dynatrace** was configured by registering city infrastructure as named services: `transit-data-feed`, `traffic-control-system`, `utility-water-grid`, `weather-ingestion-service`, and `nyc-311-feed`. The ingestion layer instruments every outbound API call so they appear as traced transactions in Dynatrace Grail. The `dynatrace_client.py` wraps the Dynatrace REST API for direct health checks. The Dynatrace MCP server is accessed by the Anomaly Detector to run DQL queries and read Davis AI problem events.
+
+**Arize Phoenix** was initialized in `arize_client.py` using `phoenix.otel.register` with project name `citypilot`. We wrote two context manager wrappers: `trace_agent_run` wraps each agent execution and records `agent.name`, `mission`, `latency_ms`, and `status` as span attributes. `trace_mcp_call` wraps each MCP tool invocation and records the tool name, server, arguments, and outcome. If prediction confidence falls below 75%, the dashboard renders a warning banner. The full trace tree with five nested spans is visible in the Phoenix UI during the demo.
+
+**Fivetran** was connected via the Fivetran REST API in `fivetran_client.py`. Three connectors are managed: one for OpenWeatherMap, one for NYC 311, one for Ticketmaster. The orchestrator agent holds the Fivetran MCP toolset and calls `update_sync_frequency` to change the weather connector from 30-minute intervals to 5-minute intervals when it detects a large event tomorrow. It calls `trigger_sync` on the 311 and events connectors to pull fresh data immediately. The agent is actively controlling its own data pipeline in response to what it discovers.
+
+### Step 5: Build the City Situation Room
+
+The frontend is a Next.js 14 App Router application built with Tailwind CSS, Mapbox GL JS, and React Query. It connects to the backend over both REST and WebSocket.
+
+The map panel uses Mapbox GL JS with two live data layers. The heatmap layer renders 311 complaint density with a color ramp from transparent blue at low density through orange to red at high density, driven by the `/api/complaints` endpoint which queries MongoDB in real time. The circle layer renders hotspot zip codes as colored markers scaled by complaint count, fetched from `/api/hotspots` which runs a MongoDB aggregation.
+
+The right sidebar has three sections. The Top Risks panel shows severity-badged risks from the agent briefing. The Agent Reasoning Trace panel streams every agent event over WebSocket as it happens: agent name, MCP tool called, what was found. The Action Plan panel shows the generated interventions and two buttons: APPROVE and Reject. Clicking APPROVE calls `POST /api/plans/approve` which writes the approval to MongoDB and broadcasts the status change to all connected clients over WebSocket.
+
+The WebSocket connection uses a custom `useSocket` hook with automatic reconnection on disconnect.
 
 ---
 
-## What We Built
+## Integrations at a Glance
 
-### The Five-Agent Pipeline
+### MongoDB
 
-Every mission flows through five specialized agents in sequence, each one passing enriched context to the next.
+The city's memory. Every signal, every plan, every approval flows through MongoDB Atlas.
 
-**Signal Collector** connects to the MongoDB MCP server and pulls all city signals relevant to the mission: 311 complaints from the last 48 hours filtered by district, upcoming events with venue capacity, weather forecast, and recent traffic incidents. It uses the MongoDB `find`, `aggregate`, and `count` tools to build a structured signal summary. No hallucination here: every number comes from the actual database.
+Collections used: `complaints` (NYC 311 with 2dsphere and vector search indexes), `sensor_readings` (time-series), `action_plans`, `resources`, `events`, `weather`, `weather_forecast`.
 
-**Anomaly Detector** takes the signal summary and finds what is unusual. It runs MongoDB aggregation pipelines comparing current complaint volume against 30-day baselines, flags zones with more than two standard deviations of deviation, and calls the Dynatrace MCP to check whether any city infrastructure services are currently degraded. If the transit API is showing elevated latency, this agent flags it: routing decisions may be based on stale data. That caveat propagates through the entire rest of the pipeline and appears in the final action plan.
+MCP tools called by agents: `find`, `aggregate` (including `$vectorSearch` pipelines), `count`, `insert-many`, `update-one`, `collection-schema`, `atlas-streams-build`, `atlas-get-performance-advisor`.
 
-**Impact Forecaster** does two things that no other team will do. First, it calls the Elastic MCP server to run a hybrid semantic search over the city knowledge base, combining BM25 keyword matching with dense vector similarity to find the Standard Operating Procedure closest to the current scenario. Second, it runs a MongoDB `$vectorSearch` aggregation pipeline against the complaints collection, which contains six months of real NYC 311 data with vector embeddings, to find historically similar incidents and their outcomes. The result is a forecast grounded in both official city policy and empirical history.
+### Elasticsearch
 
-**Operations Planner** reads the forecast and generates a concrete multi-department action plan. It queries the MongoDB resources collection for available crews, vehicles, and equipment, then produces specific actions: which bus route to reroute and via which street, how many sanitation crews to deploy and where, which intersections need traffic officers. It stores the entire plan in MongoDB using the `insert-many` tool with a `pending_approval` status.
+The city's knowledge base. Two indices hold every SOP and policy the city has ever written.
 
-**Executive Briefer** synthesizes everything into the mayoral situation report: top risks ranked by severity, a two-sentence situation summary, the action list with department assignments and timing, and quantified predicted impact. Congestion reduction. Complaint volume reduction. Population served. Confidence percentage. All of it grounded in the data the previous agents collected.
+Index `city_knowledge`: municipal regulations, emergency SOPs, maintenance procedures. Index `city_policies`: bus rerouting rules, shelter locations, deployment protocols.
 
-### The Orchestrator
-
-The root orchestrator is a Google ADK `Agent` with all five specialists registered as `sub_agents`. ADK's collaborative workflow system handles delegation and return automatically. Each sub-agent runs in `single_turn` mode, completing its task and returning control with results. The orchestrator also holds the Fivetran MCP toolset, which it uses to boost data pipeline sync frequency when an event is detected. On match day, the weather connector switches from 30-minute intervals to 5-minute intervals. The agent controls its own data ingestion.
-
-### Real Data, Not Simulation
-
-The complaint heatmap on the map is built from the real NYC 311 dataset served by the New York City Open Data Socrata API at `data.cityofnewyork.us/resource/erm2-nwe9.json`. This dataset contains over 24 million records updated daily. The seeding script pulls 30 to 90 days of history across Manhattan, Brooklyn, and Queens boroughs and bulk-upserts into MongoDB with duplicate detection on `unique_key`.
-
-Weather comes from OpenWeatherMap's forecast API. Events come from Ticketmaster Discovery API with real venue names, addresses, and capacity. All three connectors have realistic mock fallbacks for demo environments without API keys.
-
-### The City Knowledge Base
-
-The Elasticsearch indices `city_knowledge` and `city_policies` are seeded with real NYC emergency SOPs: stadium event traffic management, heavy rain response, transit disruption procedures, heat emergency protocols, water main break procedures. The index mapping uses `dense_vector` fields for semantic similarity alongside full-text fields for BM25 keyword matching. When the Impact Forecaster searches for "bus rerouting protocol during stadium event with rain and transit maintenance", it gets back the actual city playbook, not a hallucination.
-
-### Infrastructure as Services
-
-City systems are registered in Dynatrace as named services: `transit-data-feed`, `traffic-control-system`, `utility-water-grid`, `weather-ingestion-service`. Every API call the ingestion layer makes becomes a traced transaction. When the weather API slows or the 311 feed stalls, Dynatrace's Davis AI fires a problem alert. The Anomaly Detector reads these via the MCP `get_active_problems` tool and executes DQL queries like `fetch logs | filter service == "transit-data-feed" | summarize avg(duration)` to measure actual latency. The demo scenario shows the transit API latency spike mid-mission, causing the agent to flag data staleness in the final briefing. Judges see real observability woven into the agent reasoning, not a static dashboard.
-
-### AI Quality Layer
-
-Every agent span is instrumented with OpenTelemetry via Arize Phoenix. The tracer records the input prompt, which MCP tools were called, tool outputs, final reasoning, and latency per agent. The dashboard's agent health panel shows prediction confidence and tracing status. If the Impact Forecaster's confidence drops below a threshold, the system shows a warning: Prediction confidence LOW, recommend human review. This is genuine human-in-the-loop design built on real AI observability infrastructure.
-
-### The City Situation Room
-
-The frontend is a Next.js 14 application styled as a dark-mode operational command center. The map panel renders real 311 complaint density as a Mapbox GL heatmap layer, with scatterplot circles showing hotspot zip codes colored red, amber, or green by complaint volume. Risk zones from the agent's action plan appear as blue polygon markers.
-
-The right sidebar has three sections that update live. The Top Risks panel shows the three highest-severity issues identified by the agents, with severity badges. The Agent Reasoning Trace shows every agent event as it streams in over WebSocket: which agent is running, which MCP tool it just called, what it found. The Action Plan section shows the generated interventions with department, timing, and predicted impact, followed by two buttons: APPROVE and Reject. The mayor clicks Approve. MongoDB stores the result. The plan status changes to approved. The city moves.
-
----
-
-## Sponsor Integrations
-
-### MongoDB (Primary Track)
-
-MongoDB Atlas is the city's memory. Every piece of data that matters flows through it.
-
-The complaints collection uses real NYC 311 data with a `2dsphere` geospatial index for location-based queries and a vector search index named `complaint_embeddings` on the `embedding` field (768 dimensions, cosine similarity) for semantic incident retrieval. The `sensor_readings` collection uses MongoDB's native time-series collection type with `timeField: "timestamp"`, `metaField: "sensor_id"`, and `granularity: "minutes"` for IoT-style sensor data. The `action_plans` collection stores the full agent-generated plans with approval status tracked via `update-one`.
-
-Atlas Stream Processing processors watch the complaint volume in real time and trigger the Signal Collector agent via change streams when volume crosses a two-sigma threshold. The `atlas-streams-build` MCP tool creates these processors. The `atlas-get-performance-advisor` tool is called during the demo to show the system analyzing its own query patterns.
-
-The MongoDB MCP server is started as a subprocess by each agent using `StdioConnectionParams` with `@mongodb-js/mongodb-mcp-server`. Tool calls are explicit and visible in the agent trace: `find` for recent complaints, `aggregate` for hotspot analysis, `insert-many` for plan storage, `$vectorSearch` for historical similarity.
-
-### Elastic
-
-The Elastic MCP server exposes two custom indices to the Impact Forecaster agent. `city_knowledge` contains municipal regulations, emergency SOPs, infrastructure maintenance procedures, and departmental standard operating procedures. `city_policies` contains bus rerouting rules, emergency shelter locations, and crew deployment protocols.
-
-Both indices use `dense_vector` fields for kNN semantic similarity alongside `text` fields with the English analyzer for BM25. The Impact Forecaster calls the MCP search tool with queries like "bus rerouting protocol during stadium events with transit disruption" and receives the actual matching SOP, which it incorporates directly into the action plan. This hybrid search, BM25 on policy names plus vector similarity on semantic meaning, is Elastic's native superpower and it is the load-bearing mechanism for the entire forecasting step.
+Both use hybrid BM25 and dense vector search. The Impact Forecaster queries Elastic to retrieve the specific SOP that matches the current incident before generating an action plan.
 
 ### Dynatrace
 
-City infrastructure is registered in Dynatrace as services with the names `transit-data-feed`, `traffic-control-system`, `utility-water-grid`, `weather-ingestion-service`, and `nyc-311-feed`. The ingestion layer instruments its API calls so every external request becomes a traced transaction in Dynatrace Grail.
+The city's infrastructure monitor. Five city systems are registered as Dynatrace services.
 
-The Anomaly Detector calls `get_active_problems` to check for Davis AI problem alerts. It calls `execute_dql_query` to run specific DQL statements measuring transit API response time. The demo scenario throttles the transit feed mid-mission to trigger a real Dynatrace problem event, which the agent detects and flags in the briefing. Judges see the Dynatrace dashboard showing the problem event at the same moment the agent says "routing decisions may be based on stale data." That causal link, from real observability to agent reasoning to human-visible caveat, is unprecedented.
+The Anomaly Detector calls `get_active_problems` and runs DQL queries against Dynatrace Grail to measure API latency and detect degraded services. If any service is degraded, the agent writes a data staleness caveat into the briefing that propagates to the mayor's action plan.
 
 ### Arize Phoenix
 
-Phoenix is initialized via `phoenix.otel.register` with the CityPilot project name. Every agent execution is wrapped in an OpenTelemetry span using a custom `trace_agent_run` context manager that records `agent.name`, `mission`, `agent.latency_ms`, and `agent.status`. Every MCP tool call is wrapped in a `trace_mcp_call` span recording the tool name, server, arguments, and success status.
+The AI quality layer. Every agent span and every MCP tool call is traced with OpenTelemetry.
 
-The dashboard shows a Phoenix tracing indicator with the live prediction confidence score. If confidence drops below 75%, the UI renders a warning banner. The Phoenix MCP server can be queried by the orchestrator to retrieve aggregate trace data for the health summary endpoint.
+The dashboard shows live prediction confidence. Below 75% confidence, a warning banner appears recommending human review. The full five-agent trace tree is visible in the Phoenix UI with per-agent latencies and tool call details.
 
 ### Fivetran
 
-Three custom connectors built with the Fivetran Connector SDK pull data into MongoDB: OpenWeatherMap on a 30-minute schedule, NYC 311 on a daily delta sync, and Ticketmaster Events on a weekly schedule.
+The data pipeline controller. Three connectors feed city data into MongoDB on scheduled intervals.
 
-The key differentiator: the orchestrator agent calls Fivetran MCP tools to control the pipeline in response to what it discovers. When it detects an event tomorrow with large attendance, it calls `update_sync_frequency` to change the weather connector to a 5-minute interval and calls `trigger_sync` on the 311 and events connectors. An agent controlling its own data ingestion in response to what it finds is something judges will not have seen before.
+The orchestrator agent calls Fivetran MCP tools to boost sync frequency and trigger immediate syncs when it detects a high-attendance event. The agent controls its own data ingestion based on what it discovers about the mission context.
 
 ---
 
@@ -188,7 +198,7 @@ citypilot/
 - Python 3.12 or higher
 - Node.js 22 or higher
 - A MongoDB Atlas account (free M0 tier works)
-- A Google AI Studio API key
+- A Google AI Studio API key from aistudio.google.com
 
 ### Step 1: Configure environment
 
@@ -205,7 +215,7 @@ GOOGLE_API_KEY=your_key_from_aistudio.google.com
 MONGODB_URI=mongodb+srv://user:pass@cluster.mongodb.net/
 ```
 
-All other integrations (Elastic, Dynatrace, Arize, Fivetran) are optional. The system uses mock fallbacks for data sources without keys so the demo runs end-to-end regardless.
+All other integrations (Elastic, Dynatrace, Arize, Fivetran) are optional. The system falls back to mock data for any missing API key so the full demo runs regardless.
 
 ### Step 2: Seed the database with real NYC data
 
@@ -214,7 +224,7 @@ pip install -r backend/requirements.txt
 python data/seed_nyc_311.py
 ```
 
-This fetches 30 days of real NYC 311 complaints across Manhattan, Brooklyn, and Queens from the Socrata API and stores them in MongoDB. It also creates the vector search index and seeds the Elasticsearch knowledge base.
+This fetches 30 days of real NYC 311 complaints from the Socrata API, normalizes and bulk-upserts them into MongoDB, creates the vector search index, and seeds the Elasticsearch knowledge base with city SOPs.
 
 For deeper history:
 
@@ -251,23 +261,23 @@ This starts the backend, frontend, local MongoDB, and local Elasticsearch togeth
 
 ## Demo Walkthrough
 
-Open the dashboard. The map shows the Upper West Side district with a live 311 complaint heatmap. Red zones indicate high complaint density. Circle markers show hotspot zip codes.
+Open the dashboard. The map shows the Upper West Side district with a live 311 complaint heatmap rendered from real data. Red zones show high complaint density. Circle markers show hotspot zip codes.
 
-Type this mission and press Run Mission:
+Type this mission into the input bar:
 
 ```
 Prepare District 7 for tomorrow's football match at 7PM
 ```
 
-Watch the Agent Reasoning Trace panel on the right fill in real time:
+Watch the Agent Reasoning Trace panel fill in real time as each agent runs:
 
-- Signal Collector calls MongoDB `find` and `aggregate` on the complaints collection. Returns 340 complaints in the last 48 hours near the stadium area.
-- Anomaly Detector detects a 3-sigma spike near Stadium Road. Checks Dynatrace: transit-data-feed shows elevated latency.
-- Impact Forecaster calls Elastic MCP: returns the Stadium Event Traffic Management SOP. Then calls MongoDB `$vectorSearch`: finds the October 2023 match-day incident as the closest historical precedent with 91% similarity.
-- Operations Planner queries the resources collection for available crews. Generates three actions: reroute Bus M15, deploy 3 sanitation crews to Stadium Road, alert businesses on the surrounding blocks.
-- Executive Briefer assembles the situation report: 31% congestion reduction predicted, 41% complaint reduction, 8,500 people served, 87% confidence.
+1. Signal Collector calls MongoDB `find` and `aggregate`. Returns 340 complaints in the last 48 hours near the stadium area with breakdown by type and zip code.
+2. Anomaly Detector detects a 3-sigma spike near Stadium Road. Calls Dynatrace `get_active_problems`. Transit-data-feed shows elevated latency. Flags it.
+3. Impact Forecaster calls Elastic MCP. Returns the Stadium Event Traffic Management SOP. Calls MongoDB `$vectorSearch`. Finds the October 2023 match-day incident as the closest historical precedent at 91% similarity.
+4. Operations Planner queries the resources collection. Generates three specific actions: reroute Bus M15 via 2nd Avenue, deploy 3 sanitation crews to Stadium Road by 14:00, alert businesses on the surrounding blocks.
+5. Executive Briefer writes the situation report: 31% congestion reduction predicted, 41% complaint reduction, 8,500 people served, 87% confidence. Transit data caveat included.
 
-The action plan appears at the bottom of the right panel. The mayor reads it and clicks APPROVE. MongoDB stores the approval. The Dynatrace dashboard shows all city services healthy. The Arize Phoenix dashboard shows five nested agent spans with latencies and no hallucination flags.
+The action plan appears at the bottom of the right panel. Click APPROVE. MongoDB stores the approval via `update-one`. The Dynatrace dashboard shows the problem event. The Arize Phoenix dashboard shows five nested agent spans with per-agent latencies and no hallucination flags.
 
 ---
 
@@ -285,20 +295,6 @@ The action plan appears at the bottom of the right panel. The mayor reads it and
 | POST | /api/plans/approve | Mayor approves or rejects the action plan |
 | POST | /api/sync | Trigger manual data ingestion sync |
 | WS | /ws | WebSocket for real-time agent trace and map updates |
-
----
-
-## Why This Wins
-
-Most hackathon submissions build a chat interface with a database lookup underneath. CityPilot is architecturally different in every dimension.
-
-The agent pipeline is genuinely multi-agent. Five specialists each with their own MCP toolset, running in sequence with context passing between them. The orchestrator is not just routing prompts, it is coordinating a workflow with explicit data dependencies.
-
-The data is real. The 311 heatmap is built from the actual Socrata dataset that New York City publishes daily. The weather forecast is live. The events come from Ticketmaster's real API. When the agent says "340 complaints in the last 48 hours", that number came from a real query against real data.
-
-Every sponsor integration is load-bearing. Remove MongoDB and the agents have no data to work with. Remove Elastic and the forecaster has no knowledge base. Remove Dynatrace and the anomaly detector cannot assess infrastructure health. Remove Arize and there is no prediction confidence score or hallucination detection. Remove Fivetran and the agent cannot control its own data ingestion. Each sponsor does something the others cannot.
-
-The human-in-the-loop design is explicit and visible. The mayor sees the full reasoning trace. They read the plan. They click Approve. This is not just cosmetically compliant with the judging criteria: it is the architectural center of the product.
 
 ---
 
