@@ -1,0 +1,41 @@
+# ADK & Google
+google-adk>=1.0.0
+google-generativeai>=0.8.0
+
+# MCP
+mcp>=1.0.0
+
+# FastAPI
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+websockets>=13.0
+
+# MongoDB
+pymongo>=4.10.0
+motor>=3.6.0
+
+# Elasticsearch
+elasticsearch>=8.15.0
+
+# HTTP & Data
+httpx>=0.27.0
+aiohttp>=3.11.0
+requests>=2.32.0
+
+# Observability (Arize Phoenix)
+arize-phoenix>=5.0.0
+opentelemetry-api>=1.28.0
+opentelemetry-sdk>=1.28.0
+openinference-instrumentation-google-genai>=0.3.0
+
+# Data processing
+pandas>=2.2.0
+numpy>=2.1.0
+python-dotenv>=1.0.0
+pydantic>=2.9.0
+pydantic-settings>=2.5.0
+
+# Utilities
+tenacity>=9.0.0
+python-dateutil>=2.9.0
+pytz>=2024.1
